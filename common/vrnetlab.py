@@ -8,6 +8,7 @@ import math
 import os
 import random
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -79,6 +80,40 @@ def boot_delay():
         time.sleep(int(delay))
 
 
+def find_disk_image(directory: str = "/") -> str:
+    """Locate the VM's base disk image in the given directory.
+
+    Only files matching the base image are returned. Overlays created by
+    vrnetlab on (re)starts (`<name>-overlay.qcow2`) and hardlink aliases
+    that containerlab creates on container stop (`clab-<tag>.qcow2`) are
+    skipped, so that the same base image - and thereby the same overlay -
+    is discovered on every start of the container. This keeps VM state
+    (e.g. saved configs) persistent across container restarts.
+    """
+    candidates = []
+    for entry in sorted(os.listdir(directory)):
+        if not entry.endswith(".qcow2"):
+            continue
+        if entry.endswith("-overlay.qcow2"):
+            continue  # vrnetlab overlay image
+        if entry.startswith("clab-"):
+            continue  # containerlab pre-stop hardlink alias
+        candidates.append(os.path.join(directory, entry))
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No disk image found in {directory}: no .qcow2 file present"
+        )
+
+    if len(candidates) > 1:
+        logging.getLogger().warning(
+            f"Multiple disk image candidates found: {candidates}, "
+            f"picking the first one: {candidates[0]}"
+        )
+
+    return candidates[0]
+
+
 class _Console:
     """telnetlib-compatible wrapper around a scrapli channel (qemu serial console / monitor)."""
 
@@ -97,6 +132,16 @@ class _Console:
         self._driver.channel.write(data)
 
     def _read(self):
+        # channel.read() blocks until timeout_transport (3600 s) when the console is silent,
+        # so the timeout in read_until()/expect() is never evaluated and a missing prompt
+        # hangs the bootstrap. Poll the socket first and return nothing if no data is ready.
+        transport = self._driver.transport
+        sock = getattr(getattr(transport, "socket", None), "sock", None)
+        pending = getattr(transport, "_raw_buf", b"") or getattr(transport, "_cooked_buf", b"")
+        if sock is not None and not pending:
+            readable, _, _ = select.select([sock], [], [], 0.1)
+            if not readable:
+                return b""
         data = self._driver.channel.read()
         if data:
             # mirror console output to stdout so it shows up in docker logs
@@ -492,8 +537,11 @@ class VM:
 
         self.logger.debug("qemu cmd: {}".format(" ".join(cmd)))
 
+        # exec: let bash replace itself with qemu. Otherwise the fd redirections used by the
+        # macvtap datapath keep bash as the parent, stop() only terminates bash and qemu is
+        # orphaned holding the monitor/serial ports.
         self.p = subprocess.Popen(
-            " ".join(cmd),
+            "exec " + " ".join(cmd),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
